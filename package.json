@@ -1,0 +1,28 @@
+{
+  "name": "field-defibrillators",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Field Defibrillators - Pro Bono | Afeka College final project",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n api,mesh,web -c blue,magenta,green \"npm run dev:api\" \"npm run dev:mesh\" \"npm run dev:web\"",
+    "dev:api": "npm --prefix api run dev",
+    "dev:mesh": "npm --prefix mesh run dev",
+    "dev:web": "npm --prefix web run dev",
+    "install:all": "npm install && npm --prefix api install && npm --prefix mesh install && npm --prefix web install",
+    "db:schema": "npm --prefix api run db:schema",
+    "seed": "node scripts/seed.js",
+    "test:geofencing": "node scripts/test_geofencing.js",
+    "test:maintenance": "node scripts/test_maintenance_alert.js",
+    "test": "npm run test:geofencing && npm run test:maintenance"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.7",
+    "mongodb": "^6.12.0",
+    "mysql2": "^3.11.5"
+  }
+}

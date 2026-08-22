@@ -1,0 +1,93 @@
+/* ==========================================================================
+   The ONLY stylesheet in the project (Requirement #7: styling is Tailwind).
+   It contains three things and nothing else:
+     1. the three Tailwind directives,
+     2. a handful of base rules that cannot be expressed as utility classes,
+     3. small component classes built FROM Tailwind utilities with @apply,
+        so repeated combinations stay in one place.
+   ========================================================================== */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    /* dir="rtl" is set on the <html> element in layout.js. Everything else in
+       the project uses Tailwind's LOGICAL properties (ps-, pe-, ms-, me-,
+       text-start, text-end) instead of left/right, so the layout follows the
+       direction automatically. */
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+
+  /* Numbers and Latin identifiers (phone numbers, !a3f2c1b4, RSSI values) must
+     stay left-to-right even inside a right-to-left sentence. This class marks
+     them as an isolated LTR island so the punctuation does not jump around.
+
+     NOTE - deliberately NO `display` here. `unicode-bidi: isolate` is what does
+     the isolation; setting `display: inline-block` adds nothing to it and
+     actively breaks two things:
+       * on a <td> it stops the element being a table cell, so the browser
+         merges adjacent ones into a single anonymous cell and every following
+         column shifts out of alignment with its header;
+       * it overrides `block`, which `truncate` needs in order to clip text.
+     Apply this class to a <span> INSIDE a cell, never to the cell itself - a
+     cell carrying `direction: ltr` would also align its text left, against the
+     right-aligned header above it. */
+  .ltr-num {
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-slate-200 bg-white p-5 shadow-sm;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-3
+           font-semibold transition focus:outline-none focus:ring-4
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-emergency text-white hover:bg-emergency-dark focus:ring-red-200;
+  }
+  .btn-secondary {
+    @apply btn border border-slate-300 bg-white text-slate-800
+           hover:bg-slate-100 focus:ring-slate-200;
+  }
+
+  .label {
+    @apply mb-1 block text-sm font-medium text-slate-700;
+  }
+  .input {
+    @apply w-full rounded-xl border border-slate-300 px-4 py-3 text-slate-900
+           placeholder:text-slate-400 focus:border-slate-500 focus:outline-none
+           focus:ring-2 focus:ring-slate-200;
+  }
+  .input-error {
+    @apply border-emergency focus:border-emergency focus:ring-red-200;
+  }
+  .field-error {
+    @apply mt-1 text-sm text-emergency;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Leaflet needs its container to have an explicit height, and its own CSS is
+   imported by the map component. These two rules only fix things Leaflet
+   renders itself, which utility classes cannot reach.
+   -------------------------------------------------------------------------- */
+.leaflet-container {
+  font-family: inherit;
+  z-index: 0;                 /* keep the map underneath sticky headers */
+}
+.leaflet-popup-content {
+  direction: rtl;
+  text-align: right;
+  margin: 10px 12px;
+}
