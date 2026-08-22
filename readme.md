@@ -70,6 +70,3 @@ npm run dev
 
 ---
 
-## כתובת המערכת בענן
-המערכת זמינה להתנסות בענן בכתובת: 
-**https://aed-emergency-site.vercel.app/**
