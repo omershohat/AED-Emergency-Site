@@ -1,652 +1,565 @@
-# Field Defibrillators — Pro Bono
-### דפיברילטורים בשטח — מיזם התנדבותי
+# Operating Guide
 
-A real-time map of **mobile** defibrillators, with a hybrid alerting system that keeps working
-where the cellular network does not: a **433 MHz LoRa mesh** built on the Meshtastic protocol.
+How to run, drive and demonstrate **Field Defibrillators — Pro Bono**.
 
-Final project — Full-Stack Web Development, Afeka College of Engineering.
-
-> **Just want to run it and drive it?** See the **[Operating Guide](OPERATING.md)** — startup,
-> every screen explained, data management, a demonstration script and troubleshooting.
-> This file covers the architecture, the database design and the LoRa theory.
+For architecture, the database design and the LoRa theory, see [readme.md](readme.md).
+This document is about *operating* the system: starting it, using every screen, managing the data,
+and what to do when something is wrong.
 
 ---
 
-## Table of contents
+## Contents
 
-1. [The problem](#1-the-problem)
-2. [The solution](#2-the-solution)
-3. [Architecture](#3-architecture)
-4. [Why two databases](#4-why-two-databases)
-5. [Technology stack](#5-technology-stack)
-6. [Installation](#6-installation)
-7. [Running the project](#7-running-the-project)
-8. [Project structure](#8-project-structure)
-9. [API reference](#9-api-reference)
-10. [Authentication design](#10-authentication-design)
-11. [LoRa — the theory behind the integration](#11-lora--the-theory-behind-the-integration)
-12. [What is real and what is simulated](#12-what-is-real-and-what-is-simulated)
-13. [Requirements traceability](#13-requirements-traceability)
-14. [Troubleshooting](#14-troubleshooting)
+1. [At a glance](#1-at-a-glance)
+2. [Before you start](#2-before-you-start)
+3. [Starting and stopping](#3-starting-and-stopping)
+4. [Setting up on a new machine](#4-setting-up-on-a-new-machine)
+5. [Screen by screen](#5-screen-by-screen)
+6. [The admin panel](#6-the-admin-panel)
+7. [Managing the data](#7-managing-the-data)
+8. [Demonstration script](#8-demonstration-script)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Reference](#10-reference)
 
 ---
 
-## 1. The problem
-
-Sudden cardiac arrest is a race against the clock. Without defibrillation, the chance of survival
-drops by roughly 7–10% for every minute that passes; the commonly cited **"golden window" is
-0–4 minutes**. An ambulance rarely reaches a forest trail, a bike path or a ridge line in four
-minutes — but another cyclist, a runner or a hiker carrying a portable AED very often is already
-within that radius.
-
-Two things stand between that person and the casualty:
-
-1. **Nobody knows they are there.** Portable defibrillators are invisible: they are in a backpack,
-   not on a public map.
-2. **You cannot call them.** Exactly where the ambulance cannot reach, the cellular network usually
-   cannot either. A push notification or an SMS to someone with no signal is a message that is
-   never delivered.
-
-Israel's Magen David Adom publishes an excellent map of **fixed** public defibrillators — this
-project links to it prominently and is designed to complement it, not to replace it. Fixed devices
-solve the shopping-mall case. They do not solve the trail case.
-
-## 2. The solution
-
-Volunteers who carry a portable AED register on the site (no password, no account — see
-[requirement 15](#13-requirements-traceability)). Their devices report their position periodically.
-When a distress call is raised, the system samples the registered responders inside a configurable
-radius and reaches each of them on **whichever channel can actually deliver**:
-
-| Situation | Channel used | What arrives |
-|---|---|---|
-| Has cellular coverage | **SMS / cellular** | A message with the casualty's location and phone number |
-| No coverage, owns a LoRa node | **LoRa mesh (433 MHz)** | A packet that hops between nodes to their device, which beeps and blinks |
-| No coverage, no LoRa node | **Unreachable** | Nothing — and the system says so, on screen, on purpose |
-
-That third row is not an oversight. It is displayed deliberately in the UI, because the empty seat
-is the entire argument for owning a LoRa node.
-
-Selected responders receive **bicycle navigation** to the scene — routed on actual cycle paths, not
-a straight line across a river.
-
-## 3. Architecture
-
-Three processes, each with one responsibility and its own reason to exist.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  BROWSER  (Hebrew / RTL)                                    │
-└───┬─────────────────────┬───────────────────┬───────────────┘
-    │ HTML / SSR          │ REST + JWT        │ WebSocket (live alert)
-    ▼                     ▼                   ▼
-┌─────────────┐   ┌──────────────────┐  ┌──────────────────────┐
-│  web  :3000 │   │  api      :4000  │  │  mesh        :5000   │
-│  Next.js    │   │  Node + Express  │  │  Node + Express + ws │
-│  React      │   │  Identity &      │  │  Dispatch &          │
-│  Tailwind   │   │  Registry        │  │  Telemetry           │
-└─────────────┘   └────────┬─────────┘  └──────────┬───────────┘
-                           │  internal REST        │
-                           │  (x-service-key)      │
-                           │◄──────────────────────┤
-                           ▼                       ▼
-                    ┌─────────────┐        ┌──────────────┐
-                    │  MySQL 8    │        │  MongoDB     │
-                    │  (SQL)      │        │  (NoSQL)     │
-                    └─────────────┘        └──────────────┘
-```
-
-**`api` (:4000)** — the Express server required by the assignment. It owns the relational data:
-admins, sessions, registered responders, their equipment, and the admin-editable site content.
-It never opens a MongoDB connection.
-
-**`mesh` (:5000)** — the second server. It owns the document data: position heartbeats, alert
-documents, and the radio event log. It also hosts the WebSocket that drives the emergency page.
-It never opens a MySQL connection.
-
-**`web` (:3000)** — Next.js. No database access at all; it talks to the two servers over HTTP.
-
-### The dispatch flow
-
-This is the sequence worth understanding, because it is where both databases and both servers
-meet in a single user action:
-
-```
-1. mesh   $geoNear on `telemetry`      →  each responder's LATEST fix, then the radius
-2. mesh → api   GET /internal/responders?ids=…   →  turn those ids into names, phones, equipment
-3. mesh   choose a channel per responder          →  LORA / SMS / NONE
-4. mesh   GET a bicycle route for the chosen one  →  BRouter, trekking profile
-5. mesh   write the alert document, then stream the propagation over the WebSocket
-```
-
-Step 2 is a **cross-database join performed at the service layer**. Splitting the data was a
-deliberate choice, so owning the join is the price of that choice — it costs exactly one HTTP
-request per alert, not one per responder.
-
-The same join runs in the **opposite direction** for the admin panel: registrations come out of
-MySQL, and `api` asks `mesh` (`GET /internal/last-seen`) when each of those devices last
-transmitted, so the maintenance screen can show a "שידור אחרון" column. One request per page of
-20 rows, not one per row. That call degrades on purpose — if `mesh` is unreachable the admin panel
-still lists and edits registrations, and simply reports the telemetry column as unavailable.
-Managing registrations is pure MySQL work and must not stop because the telemetry service is down.
-
-## 4. Why two databases
-
-> **SQL stores *who and what*. NoSQL stores *when and where*.**
-
-**MySQL** holds data whose rows reference each other and must stay consistent:
-
-- `phone` and `lora_id` need **UNIQUE** constraints — one number, one volunteer.
-- `devices` needs a **FOREIGN KEY with ON DELETE CASCADE** — equipment cannot outlive its owner.
-- Eligibility validation is a **JOIN**, not an `if`.
-- Registering a responder together with their devices is a **transaction** — a responder stored
-  without equipment would be invisible to the dispatcher.
-
-**MongoDB** holds data that is time-series, geographic, or variably shaped:
-
-- `telemetry` is queried geographically. A **2dsphere index** with `$geoNear` answers
-  *"who is within 1500 m of this point?"* inside the database. In SQL we would pull rows out and
-  compute haversine distances in JavaScript.
-- `alerts` contains nested arrays (`candidates`, `timeline`) of unknown length — three more tables
-  and three more joins in a relational schema.
-- `mesh_events` is an append-only log where a LoRa hop carries `rssi`/`snr` and an SMS delivery
-  carries neither. A document store absorbs that without a migration.
-
-Neither database uses an ORM. `mysql2` with hand-written parameterised SQL, and the official
-`mongodb` driver with visible pipelines — every query in this project is readable and explainable.
-
-## 5. Technology stack
-
-| Layer | Choice | Note |
-|---|---|---|
-| Language | JavaScript (ESM) | `"type": "module"` in every package |
-| Frontend | Next.js 15 (App Router) + React 19 | Server components where there is no state |
-| Styling | Tailwind CSS 3.4 | The only stylesheet is `globals.css` |
-| Backend | Node.js + Express 4 (×2 servers) | |
-| Auth | `jsonwebtoken` + `bcryptjs` | Access + refresh, with a revocation whitelist |
-| SQL | MySQL 8 via `mysql2/promise` | No ORM |
-| NoSQL | MongoDB 7 via the official driver | 2dsphere geospatial index |
-| Realtime | `ws` | Attached to the same HTTP server |
-| Maps | Leaflet + OpenStreetMap | No API key, no billing account |
-| Routing | BRouter (`trekking` profile) | Free, keyless, real cycle paths |
-
-**Deliberately not used:** no ORM, no `react-leaflet`, no component library, no CSS framework other
-than Tailwind, no Google Maps or Mapbox key. Everything a reader sees is either standard library,
-one of the packages above, or code in this repository.
-
-## 6. Installation
-
-### Prerequisites
-
-| Requirement | Version | Notes |
-|---|---|---|
-| Node.js | 18 or newer | Tested on 24. Needs global `fetch` and `crypto.randomUUID` |
-| MySQL | 8.x | XAMPP / WAMP / a standalone server all work |
-| MongoDB | 6.x or 7.x | `winget install MongoDB.Server` on Windows |
-
-### Steps
+## 1. At a glance
 
 ```bash
-git clone <your-repository-url>
-cd Shohat
-npm run install:all
+cd C:\Users\idanm\Desktop\Shohat
+npm run dev
 ```
 
-Create the three environment files from their templates:
+Then open **http://localhost:3000**. Stop everything with `Ctrl+C` in that terminal.
+
+| What | Where | Notes |
+|---|---|---|
+| Website | http://localhost:3000 | Next.js |
+| Identity & Registry API | http://localhost:4000 | Express + MySQL |
+| Dispatch & Telemetry API | http://localhost:5000 | Express + MongoDB + WebSocket |
+| Admin login | `micha` / `1234` | at `/admin` |
+| MySQL database | `field_defib` | 6 tables |
+| MongoDB database | `field_defib` | 3 collections |
+
+---
+
+## 2. Before you start
+
+Two database services must be running. **They do not behave the same way on boot:**
+
+| Service | Starts automatically? | What to do |
+|---|---|---|
+| **MongoDB** | Yes — installed as an automatic Windows service | Nothing |
+| **MySQL** (via WAMP) | **No** — start type is Manual | **Launch WAMP and wait for the tray icon to turn green** |
+
+So the rule after every reboot is: **start WAMP first, then `npm run dev`.**
+
+If you forget, the api server tells you immediately and exits:
+
+```
+[api] cannot reach MySQL. Check api/.env and that the server is running.
+```
+
+That is the failure behaving correctly — it fails on startup rather than on the first visitor's
+registration.
+
+### Checking both services
 
 ```bash
-cp api/.env.example api/.env
-cp mesh/.env.example mesh/.env
-cp web/.env.local.example web/.env.local
+Get-Service MongoDB, wampmysqld64
 ```
 
-On Windows PowerShell:
-
-```powershell
-Copy-Item api\.env.example api\.env; Copy-Item mesh\.env.example mesh\.env; Copy-Item web\.env.local.example web\.env.local
-```
-
-Then open `api/.env` and set `MYSQL_PASSWORD` to your MySQL root password (XAMPP and WAMP both
-default to an empty password, in which case leave it blank).
-
-> **Two values must match between the two files:** `INTERNAL_SERVICE_KEY` in `api/.env` and in
-> `mesh/.env`. That shared secret is what lets the mesh service call `/internal/*`. If they differ,
-> every dispatch fails with `502` and the emergency page reports that the registry is unavailable.
-
-Create the tables, then fill both databases:
+Both should read `Running`. To start either one manually (needs an **administrator** terminal):
 
 ```bash
-npm run db:schema
-npm run seed
+net start MongoDB
 ```
 
-`db:schema` creates the `field_defib` database and its six tables. `seed` writes ~50 responders and
-their equipment into MySQL, plus position heartbeats into MongoDB, and creates the admin account.
-It is **idempotent** — it clears what it seeded before seeding again, so you can re-run it freely.
+```bash
+net start wampmysqld64
+```
 
-## 7. Running the project
+### Optional: make MySQL start on boot too
+
+In an administrator terminal, once:
+
+```bash
+sc config wampmysqld64 start= auto
+```
+
+---
+
+## 3. Starting and stopping
+
+### All three services together
 
 ```bash
 npm run dev
 ```
 
-One command starts all three processes with colour-coded logs:
-
-| Service | URL |
-|---|---|
-| Website | http://localhost:3000 |
-| Identity & Registry API | http://localhost:4000 |
-| Dispatch & Telemetry API | http://localhost:5000 |
-
-To run one service on its own: `npm run dev:api`, `npm run dev:mesh`, `npm run dev:web`.
-
-### Admin credentials
+This runs `concurrently`, which prefixes each line with the service that produced it —
+`api` in blue, `mesh` in magenta, `web` in green. A healthy startup looks like this:
 
 ```
-username: micha
-password: 1234
+[api]  MySQL connection OK
+[api]  Identity & Registry service listening on http://localhost:4000
+[mesh] MongoDB connection OK
+[mesh] Dispatch & Telemetry service listening on http://localhost:5000
+[mesh] WebSocket ready on ws://localhost:5000
+[web]  ▲ Next.js 15.5.22  - Local: http://localhost:3000
 ```
 
-Set in `api/.env` and stored in the database as a **bcrypt hash** — the plain password exists
-nowhere in the schema, and the seed script cannot read it back either.
+Wait for **all three** before opening the browser. The web server is usually the slowest to be
+ready on a cold start.
 
-### A five-minute tour
+### One service at a time
 
-1. **http://localhost:3000** — the landing page: the three-line LoRa explainer, the flow diagram,
-   and live counters read from MySQL.
-2. **`/simulator`** — click anywhere on the map to move the casualty, set the **radius**, then press
-   *שגרו קריאת מצוקה*.
-3. You land on **`/emergency`** and watch the propagation arrive live over the WebSocket: gateway
-   transmission, each responder notified by LoRa or SMS, the unreachable ones, and finally the
-   selected responder's bicycle route drawn on the map.
-4. **`/admin`** — log in and edit the marketing copy, then reload the landing page and watch it
-   change. Search, edit and delete registrations.
+Useful when you want to read one server's log without the others interleaving:
 
-## 8. Project structure
-
-```
-Shohat/
-├─ package.json               concurrently — one `npm run dev` for everything
-├─ readme.md                  this file
-│
-├─ api/                       Identity & Registry      :4000
-│  ├─ server.js               middleware order, CORS, route mounting
-│  ├─ db/
-│  │  ├─ schema.sql           the relational schema, commented table by table
-│  │  ├─ pool.js              connection pool, query(), withTransaction()
-│  │  └─ applySchema.js       `npm run db:schema`
-│  ├─ lib/
-│  │  ├─ tokens.js            sign / verify / hash / cookie options
-│  │  └─ validate.js          registration rules, phone + LoRa id normalisation
-│  ├─ middleware/
-│  │  ├─ verifyJwt.js         the guard on /admin
-│  │  ├─ serviceKey.js        the guard on /internal
-│  │  └─ common.js            logger, asyncHandler, 404, error handler
-│  └─ routes/                 auth · responders · admin · content · internal
-│
-├─ mesh/                      Dispatch & Telemetry     :5000
-│  ├─ server.js               http.createServer so HTTP and WS share the port
-│  ├─ db/mongo.js             connection + index creation on startup
-│  ├─ lib/
-│  │  ├─ dispatch.js          THE DISPATCH ENGINE — read this one first
-│  │  ├─ realtime.js          WebSocket hub, subscriptions, heartbeat
-│  │  └─ routing.js           BRouter bicycle routing + haversine fallback
-│  ├─ middleware/common.js    logger, asyncHandler, 404, error handler
-│  └─ routes/                 alerts · telemetry · route
-│
-├─ web/                       Next.js front end        :3000
-│  ├─ app/
-│  │  ├─ layout.js            <html lang="he" dir="rtl">
-│  │  ├─ page.js              landing page (server component)
-│  │  ├─ register/            registration form
-│  │  ├─ simulator/           the red button
-│  │  ├─ emergency/           the live dispatch console
-│  │  ├─ buy/                 LoRa vendors, 433 MHz warning
-│  │  └─ admin/               guard, login, three management tabs
-│  ├─ components/             Header · Footer · MapCanvas · WorkflowDiagram
-│  └─ lib/
-│     ├─ api.js               fetch client for both servers + silent refresh
-│     ├─ auth.js              admin session context
-│     ├─ useAlertSocket.js    the WebSocket hook
-│     ├─ server-data.js       server-side loading with graceful fallbacks
-│     └─ config.js            URLs, defaults, channel vocabulary
-│
-└─ scripts/seed.js            fills BOTH databases in one pass
+```bash
+npm run dev:api
 ```
 
-## 9. API reference
+Also `npm run dev:mesh` and `npm run dev:web`.
 
-### `api` — http://localhost:4000
+Be aware of the dependencies when running services alone:
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/auth/login` | — | Returns an access token + sets the refresh cookie |
-| POST | `/auth/refresh` | cookie | Rotates the refresh token, returns a new access token |
-| POST | `/auth/logout` | cookie | Revokes the session |
-| GET | `/auth/me` | Bearer | Confirms the token is still valid |
-| POST | `/responders` | — | **Public registration** (no password) |
-| GET | `/responders/phone-taken` | — | Live availability check for the form |
-| GET | `/responders/stats` | — | Aggregate counters for the landing page |
-| GET | `/content/:pageKey` | — | Admin-editable copy for one page |
-| GET | `/content/links/:category` | — | `BUY_LORA` \| `OFFICIAL_MAP` \| `LEARN` |
-| GET | `/admin/responders` | Bearer | Search + paging over the registration database |
-| PATCH | `/admin/responders/:id` | Bearer | Edit a registration |
-| DELETE | `/admin/responders/:id` | Bearer | Delete (devices cascade) |
-| PUT | `/admin/content/:page/:section` | Bearer | Save a content block |
-| POST/PATCH/DELETE | `/admin/links/:id?` | Bearer | Manage external links |
-| GET | `/internal/responders` | service key | **Server-to-server** id → person |
-| GET | `/internal/last-seen` | service key | *(on mesh)* **Server-to-server** id → last transmission |
+- `web` alone → pages render, but with their "service unavailable" states.
+- `mesh` alone → telemetry works, but **dispatch fails**: it needs `api` to look up who the
+  responders are.
+- `api` alone → registration and the admin panel work fully; the simulator and emergency pages do not.
 
-### `mesh` — http://localhost:5000
+### Stopping
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/alerts` | Raise a distress call — the dispatch engine entry point |
-| GET | `/alerts` | Recent calls |
-| GET | `/alerts/:alertId` | One call with candidates, route and timeline |
-| GET | `/alerts/:alertId/events` | The raw radio log behind the timeline |
-| GET | `/internal/last-seen` | **Server-to-server** — when did these devices last transmit? (service key) |
-| POST | `/telemetry` | One device heartbeat (what a real gateway would send) |
-| GET | `/telemetry/latest` | Newest position per **currently transmitting** device, plus counts of those withheld as silent |
-| GET | `/route` | Bicycle routing proxy |
-| GET | `/maintenance/alerts` | Devices currently below the battery threshold |
-| GET | `/maintenance/history` | Open and resolved alerts, the audit trail |
-| POST | `/maintenance/reconcile` | Re-evaluate every device from its latest heartbeat (idempotent) |
+`Ctrl+C` in the terminal running `npm run dev` stops all three.
 
-WebSocket: connect to `ws://localhost:5000`, send `{"type":"SUBSCRIBE","alertId":"ALR-…"}`, then
-receive `TIMELINE`, `ROUTE` and `DONE` frames as the alert propagates.
+If a process was orphaned and a port stays occupied, find and kill it:
 
-## 10. Authentication design
-
-```
-LOGIN
-  password ──bcrypt.compare──► admins.password_hash
-       │
-       ├──► ACCESS TOKEN   15 min   JSON body      → kept in React memory
-       └──► REFRESH TOKEN   7 days  httpOnly cookie → SHA-256 hash stored in DB
-
-EVERY ADMIN REQUEST      Authorization: Bearer <access token>
-
-WHEN IT EXPIRES (401 TOKEN_EXPIRED)
-  POST /auth/refresh  ─► signature check
-                      ─► whitelist check in refresh_tokens
-                      ─► ROTATION: old row revoked, new token issued
+```bash
+netstat -ano | findstr ":4000"
 ```
 
-Design decisions, and the reasoning behind each:
+The last column is the PID. Then:
 
-- **The access token lives in a JavaScript variable, not `localStorage`.** Any injected script can
-  read `localStorage`. A module variable dies with the tab, and the session is restored silently
-  from the cookie on the next load.
-- **The refresh token is `httpOnly`, `sameSite=strict`, `path=/auth`.** The page's JavaScript cannot
-  read it at all, and it is not attached to cross-site requests, which is the CSRF defence.
-- **Only a SHA-256 hash of it is stored.** A leak of the `refresh_tokens` table hands an attacker
-  nothing usable. bcrypt is used for passwords (low entropy, worth slowing down) but not here — a
-  signed random token is not brute-forceable, and this hash is computed on every silent refresh.
-- **Rotation with reuse detection.** Each refresh revokes the old row and issues a new one.
-  If a token that was *already rotated away* is presented, that means either theft or a stale tab —
-  so **every** session belonging to that admin is revoked immediately.
-- **Login never distinguishes "no such user" from "wrong password."** Different messages would let
-  an attacker enumerate valid usernames.
-- **The front end shares one in-flight refresh promise.** Three simultaneous `TOKEN_EXPIRED`
-  responses must not trigger three refreshes — the second and third would present a token the first
-  already rotated, and the server would correctly treat that as a replay.
-
-## 11. LoRa — the theory behind the integration
-
-### What LoRa actually is
-
-**LoRa** ("Long Range") is a *physical layer* radio modulation developed by Semtech. It uses
-**Chirp Spread Spectrum (CSS)**: instead of encoding bits by shifting amplitude or phase at a fixed
-frequency, each symbol is a *chirp* — a signal that sweeps across the channel bandwidth. Spreading
-the energy across a wide band and a relatively long time makes the signal remarkably robust: a LoRa
-receiver can demodulate a transmission that is **below the noise floor**, tens of dB weaker than
-anything a conventional narrowband receiver could recover.
-
-That property is the whole story. It buys enormous **link budget** — and therefore range — and pays
-for it with **data rate**.
-
-| Parameter | Typical value | Consequence |
-|---|---|---|
-| Spreading factor | SF7 … SF12 | Higher SF = longer range, slower, longer airtime |
-| Bandwidth | 125 / 250 / 500 kHz | Narrower = more range, less throughput |
-| Data rate | ~0.3 – 27 kbit/s | Text, not voice; certainly not video |
-| Range (urban) | ~1 – 3 km | Buildings and foliage dominate |
-| Range (line of sight) | 10 km and beyond | Ridge to ridge is the best case |
-| Power draw | Milliwatts, in bursts | A node runs for days on a small battery |
-
-A LoRa link is therefore useless for a phone call and perfect for a coordinate.
-
-### Why 433 MHz specifically
-
-LoRa hardware is sold for several bands, and **the band is a hardware property, not a setting**:
-433, 868 and 915 MHz radios are physically different modules. A 868 MHz device will never hear a
-433 MHz device — which is why the purchase page in this project warns about it as loudly as it does.
-
-433 MHz (the 433.05–434.79 MHz ISM segment) is the band used for this project's region. Lower
-frequency means longer wavelength, which diffracts around obstacles and penetrates vegetation
-better than 868 or 915 MHz — exactly the terrain this system targets. The trade-offs are a smaller
-antenna-efficiency-to-size ratio at practical antenna lengths, and a busier band: 433 MHz ISM is
-shared with car key fobs, weather stations and (overlapping) the 70 cm amateur band, so ISM users
-must tolerate interference from other legitimate users.
-
-> **Regulatory note.** ISM operation is subject to transmit-power and duty-cycle limits set by the
-> national regulator (in Israel, the Ministry of Communications). Duty-cycle limits in particular
-> constrain how often a node may transmit. Anyone deploying real hardware should verify the current
-> rules rather than rely on this document.
-
-### How Meshtastic turns radios into a network
-
-Raw LoRa gives you a point-to-point link. **Meshtastic** is the open-source firmware that turns a
-collection of those links into a self-organising **mesh**:
-
-- Every node is both an endpoint and a repeater. There is no base station and no infrastructure.
-- A packet is **flooded**: a node that receives a packet it has not seen before rebroadcasts it.
-- Loops are prevented by a **hop limit** (typically 3, configurable) and by **deduplication** on a
-  packet id, so a packet is relayed once per node and then dies.
-- Traffic on a channel is **encrypted with AES-256** using a pre-shared key, so anyone without the
-  channel key hears noise.
-- Payloads are small — on the order of ~200 bytes — which fits a position report with room to spare.
-- Nodes broadcast periodic **position and telemetry** packets, which is precisely the `telemetry`
-  collection in this project's MongoDB.
-
-Note that Meshtastic is **not LoRaWAN**. LoRaWAN is a star topology that requires gateways and a
-network server; Meshtastic is peer-to-peer and needs nothing but the devices themselves. For a
-group of cyclists on a trail, that distinction is the difference between "works" and "does not."
-
-### Why this fits emergency alerting so well
-
-The message this system needs to deliver is a **latitude, a longitude and an identifier** — a few
-dozen bytes, sent rarely, that must arrive where there is no infrastructure. That is the exact shape
-of problem LoRa was designed for. A cardiac-arrest alert is small, urgent, infrequent, and worthless
-if it depends on a cell tower that is not there.
-
-The honest limitations, which belong in any defence of this design:
-
-- **Latency is seconds, not milliseconds.** Airtime at high spreading factors plus per-hop relaying
-  means a mesh delivery can take several seconds. Against a four-minute window, acceptable.
-- **Delivery is not guaranteed.** Flooding is best-effort. There is no ACK from an unknown recipient.
-- **Density is required.** A mesh with one node is a radio talking to itself. Coverage improves
-  quadratically with adoption, which is why the site markets the hardware at all.
-- **It is a complement, not a replacement.** The system states plainly on every page that it does
-  not replace calling 101.
-
-### How the two channels are chosen
-
-The decision is made per responder, per alert, from data — not from a random number:
-
-```js
-function chooseChannel({ hasLora, cellCoverage }) {
-  if (cellCoverage) return 'SMS';    // location + casualty's phone number
-  if (hasLora)      return 'LORA';   // 433 MHz mesh reaches them anyway
-  return 'NONE';                     // shown deliberately: this is the gap LoRa closes
-}
+```bash
+taskkill /F /PID <pid>
 ```
-
-`cellCoverage` is stored on the **telemetry document**, not on the responder, because coverage is a
-property of *where someone is*, not of *who they are*.
-
-### "Recently transmitting" is one rule, applied everywhere
-
-A device only exists to the system if it has broadcast within
-`MAX_HEARTBEAT_AGE_MIN` (default **180 minutes**, set in `mesh/.env`). That threshold lives in
-`mesh/lib/freshness.js` and is imported by both the map endpoint and the dispatch engine, so the
-two can never disagree — **a device the map draws as present is always a device the dispatcher is
-willing to send**, and a silent one is neither drawn nor dispatched. `GET /telemetry/latest`
-reports the withheld devices as a count rather than dropping them silently, so the simulator can
-say "50 of 51 transmitting" instead of quietly showing one dot fewer than the database holds.
-
-Order of operations matters here, and getting it backwards is a subtle trap. The pipeline reduces
-each responder to their **latest** heartbeat *first*, and only then applies the radius:
-
-```js
-{ $geoNear: { …, query: { ts: { $gte: cutoff } } } },  // no maxDistance - see below
-{ $sort:  { ts: -1 } },
-{ $group: { _id: '$responderId', latest: { $first: '$$ROOT' } } },
-{ $replaceRoot: { newRoot: '$latest' } },
-{ $match: { distanceM: { $lte: radiusM } } },          // radius vs. the CURRENT position
-```
-
-Putting `maxDistance` inside `$geoNear` would filter individual *heartbeats* rather than
-*responders*. A volunteer who was beside the casualty an hour ago but has since ridden five
-kilometres away would keep their old in-radius heartbeat, lose their newer out-of-radius one, and
-be dispatched as though standing on the scene. `$geoNear` annotates every heartbeat with its own
-`distanceM`, so filtering after the `$group` measures where each responder actually is now.
-
-### Low-battery maintenance alerts
-
-A defibrillator that is present but flat is worse than none at all — the map shows a rescuer who
-cannot rescue. When a heartbeat reports a battery below **20%** (`LOW_BATTERY_THRESHOLD`), the mesh
-service raises a maintenance alert and sends the owner a simulated SMS asking them to charge the
-unit *before* anyone needs it.
-
-The state machine, in `mesh/lib/maintenance.js`:
-
-```
-drops below 20%   ->  OPEN alert created, owner notified ONCE
-stays below 20%   ->  existing alert updated, NO second notification
-recovers to >=20% ->  alert RESOLVED, kept for the audit trail
-```
-
-Deduplication is the point. A LoRa node reports every few minutes, so a naive implementation would
-text the owner dozens of times before the battery died. "At most one OPEN alert per responder per
-type" is enforced by a **unique partial index** in MongoDB rather than by a check-then-insert in
-application code, so even two simultaneous heartbeats cannot produce two notifications.
-
-Note the split: the low-battery *status* shown in the UI is **derived on read** (`batteryLevel <
-threshold`, always current), while an alert *record* is written only when a notification actually
-goes out. Storing the status as well would give two sources of truth that could disagree.
-
-Because `scripts/seed.js` writes telemetry straight into MongoDB rather than through
-`POST /telemetry`, seeded low batteries never pass the ingest hook — so the seed finishes by calling
-`POST /maintenance/reconcile`, which brings the alert table in line with the current telemetry. It
-is idempotent.
-
-### Device health drives selection, not just display
-
-Every telemetry heartbeat also carries two independent readings (Requirement #1):
-
-- **`batteryLevel`** (0–100%) — the radio/phone's own battery.
-- **`isOperational`** — whether the **defibrillator itself** passed its self-test, `null` when the
-  responder carries no AED at all. It is deliberately decoupled from `batteryLevel`: a fully charged
-  phone can be paired with an AED that has expired pads or failed diagnostics, and the reverse is
-  just as true.
-
-Both live in MongoDB, not MySQL, for the same reason position does: they change over time and are
-only meaningful alongside the broadcast timestamp they were measured at, not as a static property
-of the responder's registration row.
-
-`isOperational` is not decoration — it changes who gets selected. `mesh/lib/dispatch.js` scores each
-reachable candidate before picking who to route to:
-
-```js
-const score = (c) => (c.hasAed ? (c.isOperational === false ? 1 : 2) : 0);
-```
-
-An AED confirmed broken outranks having no AED at all (a responder can still start CPR), but is
-deliberately ranked **below** an operational one regardless of distance — the system will pass over
-the nearest responder in favour of a farther one whose defibrillator actually works. When no
-operational AED is reachable and the algorithm has to fall back to a broken one, the emergency page
-shows an explicit warning rather than presenting it as a normal dispatch.
-
-## 12. What is real and what is simulated
-
-Requirement 1 of the assignment is that the scenario is a **web simulator** — no radio hardware is
-submitted. Being precise about the boundary matters more than blurring it:
-
-| Component | Status |
-|---|---|
-| Both databases, schema, indexes, queries | **Real** |
-| JWT authentication with rotation and revocation | **Real** |
-| Registration, validation, admin CRUD | **Real** |
-| Geospatial radius search (`$geoNear`, 2dsphere) | **Real** |
-| Cross-database, cross-service join | **Real** |
-| WebSocket streaming to the browser | **Real** |
-| Bicycle routing on actual cycle paths | **Real** (BRouter, live external service) |
-| Map and tiles | **Real** (OpenStreetMap) |
-| Device positions and heartbeats | **Seeded** — written by `scripts/seed.js`, in the exact format a real gateway would POST |
-| Device health (`batteryLevel`, `isOperational`) | **Seeded**, but the dispatch decision it drives is **real** — see below |
-| Radio propagation, hop counts, RSSI/SNR | **Simulated** — plausible values written to `mesh_events` |
-| SMS delivery | **Simulated** — no message is sent to any carrier |
-| LoRa downlink (beep/blink) | **Simulated** — a document plus a WebSocket frame |
-
-The simulated parts all sit behind the same interfaces the real ones would use. `POST /telemetry` is
-the endpoint a Meshtastic gateway would call; the seed script calls it in the same shape. Replacing
-the simulation with hardware would mean pointing a real gateway at that endpoint — not rewriting
-the system.
-
-## 13. Requirements traceability
-
-| # | Requirement | Where it lives |
-|---|---|---|
-| 1 | Web-based simulator, no hardware; device health (`batteryLevel`, `isOperational`) | `mesh/lib/dispatch.js` → `simulatePropagation()`, `score()` |
-| 2 | Hebrew, right-to-left by default | `web/app/layout.js` — `<html lang="he" dir="rtl">` |
-| 3 | Convenient admin panel | `web/app/admin/` — three tabs |
-| 4 | 3-line LoRa explainer + flow diagram | `web/app/page.js`, `web/components/WorkflowDiagram.js` |
-| 5 | Prominent emergency page | `web/app/emergency/page.js` |
-| 6 | Registration fields, last name optional | `api/db/schema.sql` → `responders` |
-| 7 | Responsive, Tailwind only | mobile-first; `globals.css` is the only stylesheet |
-| 8 | Eligibility validation | `devices` table + `api/lib/validate.js` |
-| 9 | ~50 seeded users, random sampling, last broadcast time | `scripts/seed.js`, `$sample`, `lastSeenMinutes` |
-| 10 | Radius parameter + bicycle routing | `$geoNear maxDistance`, `mesh/lib/routing.js` |
-| 11 | JWT admin login, `micha`/`1234` | `api/routes/auth.routes.js` |
-| 12 | Admin edits marketing pages + database | `content_blocks`, `external_links`, admin tabs |
-| 13 | External MDA map link | `external_links` (`OFFICIAL_MAP`), landing page + footer |
-| 14 | 3+ LoRa vendors, 433 MHz emphasis | `external_links` (`BUY_LORA`), `web/app/buy/page.js` |
-| 15 | Frictionless registration, no password | No password column exists on `responders` |
-
-## 14. Troubleshooting
-
-**`cannot reach MySQL` on startup**
-Check that the MySQL service is running and that `MYSQL_PASSWORD` in `api/.env` matches your server.
-XAMPP and WAMP default to an empty root password.
-
-**`cannot reach MongoDB. Is mongod running?`**
-Start the MongoDB service. On Windows: `net start MongoDB`, or install it with
-`winget install MongoDB.Server`.
-
-**Every dispatch fails with 502 / "שירות הרישום אינו זמין"**
-`INTERNAL_SERVICE_KEY` differs between `api/.env` and `mesh/.env`. They must be identical.
-
-**The seed script fails with `Table 'field_defib.admins' doesn't exist`**
-Run `npm run db:schema` first.
-
-**The route on the map is a dashed grey line**
-BRouter was unreachable, so the system fell back to a straight line and says so on screen. Check
-your internet connection; the rest of the simulation is unaffected.
-
-**The registration form rejects a phone number that looks fine**
-The server expects an Israeli mobile: `05X` followed by 7 digits. Spaces, dashes and a `+972`
-prefix are normalised automatically; landlines are not accepted.
 
 ---
 
-## Academic note
+## 4. Setting up on a new machine
 
-This project was written for the Full-Stack Web Development course at Afeka College. It is a
-teaching simulator, not a medical device, and it is not a substitute for calling **101**.
+Already done on this computer. This section is for a fresh clone — for example, on the machine
+where the project is graded.
 
-The LoRa hardware links on the purchase page point to third-party vendors. They are provided for
-information; this project is not affiliated with, and receives nothing from, any of them.
-#   A E D - E m e r g e n c y - S i t e  
- 
+**Prerequisites:** Node.js 18+, MySQL 8, MongoDB 6/7/8.
+
+```bash
+git clone <repository-url>
+cd Shohat
+npm run install:all
+```
+
+Create the three environment files:
+
+```bash
+Copy-Item api\.env.example api\.env; Copy-Item mesh\.env.example mesh\.env; Copy-Item web\.env.local.example web\.env.local
+```
+
+Open `api/.env` and set `MYSQL_PASSWORD` to the MySQL root password (blank for a default
+WAMP/XAMPP install).
+
+> **`INTERNAL_SERVICE_KEY` must be identical in `api/.env` and `mesh/.env`.** It is the shared
+> secret the dispatch service uses to call `/internal/*`. If the two differ, every distress call
+> fails with `502`.
+
+Create the tables, then fill both databases:
+
+```bash
+npm run db:schema
+```
+
+```bash
+npm run seed
+```
+
+Then `npm run dev` as usual.
+
+---
+
+## 5. Screen by screen
+
+### `/` — Landing page
+
+The public face of the project. The hero text, the three-line LoRa explainer and the
+"how it works" paragraph are all **read from the database** and editable from the admin panel —
+change them there and this page changes on reload.
+
+The three counters (registered volunteers, defibrillator carriers, LoRa devices) are live
+`COUNT` queries against MySQL, not fixed numbers.
+
+Below the diagram sits the prominent link to the official **Magen David Adom** map of fixed
+public defibrillators.
+
+### `/register` — Volunteer registration
+
+No password and no account — that is the design, enforced by the schema itself.
+
+| Field | Required | Notes |
+|---|---|---|
+| שם פרטי (first name) | Yes | At least 2 characters |
+| שם משפחה (last name) | No | Genuinely optional |
+| נייד (mobile) | Yes | Israeli mobile `05X` + 7 digits. Spaces, dashes and `+972` are accepted and normalised |
+| יישוב (city) | No | |
+| Equipment | **At least one** | Defibrillator, LoRa device, or both |
+| מזהה LoRa | Only if LoRa ticked | Meshtastic node id, e.g. `!a3f2c1b4` |
+
+Two rules to demonstrate deliberately, because they are graded requirements:
+
+- Submitting with **neither** equipment box ticked is rejected — a volunteer with no equipment has
+  nothing to contribute to a rescue.
+- Registering a phone number that already exists is rejected by a **UNIQUE constraint in the
+  database**, not by application code that could be bypassed.
+
+The number is also checked for availability as soon as you leave the phone field.
+
+### `/simulator` — Raising a distress call
+
+This is the control room. What each control does:
+
+| Control | Effect |
+|---|---|
+| **Clicking the map** | Moves the casualty. The red circle follows |
+| **רדיוס חיפוש** (200–5000 m) | Sent to the server as `maxDistance` in the `$geoNear` query. The circle on screen *is* the searched area |
+| **כמה מתנדבים לדגום** (1–15) | How many of the responders inside the radius to sample randomly (`$sample`) |
+| **שם / טלפון הקורא** | Appear in the SMS text and on the emergency page |
+
+The grey dots on the map are the seeded volunteers at their last known positions. Click one to
+open its popup — alongside the LoRa id and coverage it shows **battery level** and, for AED
+carriers, whether their defibrillator **passed its last self-test** (Requirement #1). Both are
+generated by the seed script and refresh every time you run `npm run seed`.
+
+**Only devices that transmitted in the last 180 minutes are drawn.** The banner above the map
+states this explicitly — for example *"מוצגים 50 מתוך 51 מכשירים רשומים"* — so a map with fewer
+dots than you expect is the freshness rule working, not data loss. The same threshold governs
+dispatch, so anything hidden from the map is also refused by the dispatcher. Change it with
+`MAX_HEARTBEAT_AGE_MIN` in `mesh/.env`.
+
+**Choosing where to click matters for a good demonstration.** The seeded devices are clustered
+around Yarkon Park. Clicking dead centre can select a responder 80 m away, which produces a
+100 m route that proves nothing. **Click toward the edge of the cluster** and you get a route of
+1–3 km that visibly winds along real cycle paths — which is the point of requirement #10.
+
+Press **🆘 שגרו קריאת מצוקה** and you are taken to the emergency page.
+
+### `/emergency` — The live dispatch console
+
+Opening this page without an alert id shows the most recent call. With no calls at all it shows
+a green "no active distress call" state.
+
+**The four tiles** summarise the dispatch: how many were found in the radius, how many are
+reachable over LoRa, how many over SMS, and how many cannot be reached at all.
+
+**The map** shows the casualty (🆘, pulsing), every sampled responder coloured by channel, and the
+bicycle route of the responder who is on the way.
+
+| Marker | Meaning |
+|---|---|
+| 🆘 red, pulsing | The casualty |
+| 🚴 green, pulsing | The selected responder — the one actually riding |
+| 📡 purple | Reached over the 433 MHz LoRa mesh |
+| 📱 cyan | Reached over the cellular network by SMS |
+| ✖ grey | **Unreachable** — no coverage and no LoRa device |
+
+Those grey markers are shown on purpose. They are the gap that owning a LoRa node closes, and
+they are the strongest argument the project makes.
+
+**The table** lists every sampled responder with their channel, air distance, **when they last
+broadcast**, what they carry (🫀 defibrillator, 📡 LoRa node), and a **מצב מכשיר** column with their
+battery level and — only for AED carriers — a **תקין / לא תקין** (operational / not operational)
+badge. It is blank for anyone without a defibrillator; that is deliberate, so "no AED" is never
+drawn as "broken AED."
+
+**The timeline** on the side fills in live over roughly 8 seconds, streamed over the WebSocket as
+the alert propagates. Events arriving while you watch are marked with a red edge. The badge at the
+top right shows whether the socket is connected.
+
+**How the responder is chosen** — three tiers, evaluated in order, distance breaking ties only
+within a tier:
+
+1. Carries a defibrillator that is **operational** (or its health was never reported).
+2. Carries a defibrillator confirmed **not** operational.
+3. No defibrillator at all — can still start CPR.
+
+The system will skip the nearest responder in favour of a farther one whose AED actually works. If
+it has to fall back to tier 2 because nothing better is reachable, the responder card on the
+emergency page shows an amber **"הדפיברילטור דיווח כלא תקין"** warning — this is Requirement #1's
+`is_operational` field changing a real decision, not just being displayed.
+
+If the route draws as a **dashed grey line**, the external routing service was unreachable and the
+system fell back to a straight line — it says so on screen rather than pretending.
+
+### `/buy` — LoRa equipment
+
+The vendor list, the 433 MHz warning, and the MDA link again. Everything here is database-driven
+and editable from the admin panel.
+
+The warning at the top is not filler: the frequency is a **hardware** property. A 868 MHz device
+will never hear a 433 MHz device, and the same model is sold in both.
+
+---
+
+## 6. The admin panel
+
+Go to **`/admin`** and log in with **`micha` / `1234`**.
+
+### How the session behaves
+
+Worth understanding, because it looks like magic if you have not seen it before:
+
+- The **access token lasts 15 minutes** and lives only in the page's memory.
+- Pressing **F5 keeps you logged in** — the page is silently re-authenticated from the refresh
+  cookie, which JavaScript cannot read.
+- After 15 minutes of use, the next request renews the token **without interrupting you**.
+- **התנתקות** (logout) revokes the session in the database. Clearing the cookie alone would not be
+  enough — a stolen copy of the token would still work.
+
+### מאגר המתנדבים — the registration database
+
+- **Search** by name, phone or LoRa id. Typing is debounced by 350 ms, so it queries once you pause
+  rather than on every keystroke.
+- **Filter** by equipment type.
+- **סוללה** — battery level, shown in red with a **טעינה נדרשת** badge below 20%. When any device
+  is low, an amber banner at the top of the tab lists everyone needing attention, with their phone
+  number and whether the maintenance SMS went out — the administrator's work queue.
+- **שידור אחרון** — when that device last transmitted. This is the only column not sourced from
+  MySQL: `api` fetches it from `mesh` over the internal service call, one request per page. A
+  device past the 180-minute threshold is greyed and tagged **שקט**, meaning the dispatcher will
+  not send to it. A responder who has never transmitted at all reads **מעולם לא שידר** — a
+  different state from having gone quiet. If the mesh service is down the column reads **לא זמין**
+  and everything else on the screen keeps working.
+- **פעיל / מושהה** — click the badge to suspend a volunteer. A suspended volunteer stays in the
+  database but is invisible to the dispatcher.
+- **עריכה** — edit name, phone, LoRa id and city.
+- **מחיקה** — permanent. Their equipment rows are removed with them automatically by the database's
+  `ON DELETE CASCADE`, not by application code.
+
+### תוכן שיווקי — the marketing copy
+
+Pick a page, edit a block, press **שמירת הבלוק**, then reload the public page to see the change.
+This is requirement #12: marketing text is maintained by the administrator, with no developer and
+no redeploy.
+
+One special case worth knowing: in **הסבר LoRa**, **each line becomes a numbered step** on the
+landing page. Three lines produce three steps. Add a fourth line and a fourth step appears.
+
+### קישורים חיצוניים — the external links
+
+Three categories in one place: the LoRa vendors, the official MDA map, and learning resources.
+The vendor screen shows a live count against the required minimum of three.
+
+---
+
+## 7. Managing the data
+
+### Reset to a clean state
+
+```bash
+npm run seed
+```
+
+Clears and rewrites everything the seeder owns: 50 volunteers with their equipment, the admin
+account, the content blocks, the external links, and all telemetry. It also clears any alerts left
+over from testing.
+
+**Run this before a presentation** so the alert history is clean and the counters read exactly 50.
+
+It is safe to run repeatedly, and it does **not** require `npm run db:schema` again — that one only
+creates the tables and has already been done.
+
+### Rebuild the tables from scratch
+
+Only needed if the schema itself changed or the database was dropped:
+
+```bash
+npm run db:schema
+```
+
+Then re-seed.
+
+### Looking inside MySQL
+
+The easiest route on this machine is **phpMyAdmin**, which WAMP already provides:
+
+**http://localhost/phpmyadmin** — user `root`, empty password, database `field_defib`.
+
+Command line is also available, though `mysql` is not on the PATH here:
+
+```bash
+& "C:\wamp64\bin\mysql\mysql8.4.7\bin\mysql.exe" -u root field_defib
+```
+
+Useful queries:
+
+```sql
+SELECT COUNT(*) FROM responders;
+SELECT r.first_name, r.phone, GROUP_CONCAT(d.kind) AS gear
+  FROM responders r LEFT JOIN devices d ON d.responder_id = r.id
+  GROUP BY r.id LIMIT 10;
+SELECT id, admin_id, expires_at, revoked_at FROM refresh_tokens ORDER BY id DESC LIMIT 5;
+```
+
+That last one is a good thing to have on screen during a defence: you can watch a row appear when
+you log in, and watch `revoked_at` fill in when the token rotates or you log out.
+
+### Looking inside MongoDB
+
+No shell is installed on this machine. Two options if you want one:
+
+```bash
+winget install MongoDB.Compass.Full
+```
+
+A graphical browser — open `field_defib` and look at the `alerts` collection. Showing a real alert
+document, with its nested `candidates` and `timeline` arrays, is a strong way to answer
+*"why did this need a document database?"*
+
+```bash
+winget install MongoDB.Shell
+```
+
+Gives you `mongosh` for a command line instead.
+
+### Inspecting through the API instead
+
+This needs nothing installed and works right now, with the servers running:
+
+```bash
+curl http://localhost:4000/health
+```
+
+```bash
+curl http://localhost:5000/telemetry/latest
+```
+
+```bash
+curl "http://localhost:5000/alerts?limit=5"
+```
+
+```bash
+curl http://localhost:5000/alerts/ALR-XXXXXX/events
+```
+
+That last one returns the raw radio log for a call — one row per delivery, with hop counts and
+signal strength per LoRa node.
+
+---
+
+## 8. Demonstration script
+
+A ten-minute walkthrough, in a sensible order, that hits all fifteen requirements.
+
+**Before you begin:** start WAMP, run `npm run seed`, run `npm run dev`, and confirm you have
+internet — the bicycle routing calls an external service. Everything else works offline.
+
+| # | Do this | Point out |
+|---|---|---|
+| 1 | Open `/` | Hebrew RTL throughout; the counters are live SQL; the three-line LoRa explainer and the flow diagram are the two-channel design |
+| 2 | Scroll to the MDA link | Requirement #13 — this project complements the official map of fixed devices |
+| 3 | Open `/register`, tick nothing, submit | Rejected: eligibility is a rule, not a suggestion |
+| 4 | Tick the defibrillator box, submit | Registered with no password anywhere — the column does not exist |
+| 5 | Try registering the same number again | Rejected by a UNIQUE constraint in the database |
+| 6 | Open `/simulator` | The banner: only devices transmitting in the last 180 min are shown, and the same rule governs dispatch. Explain radius → `$match` on the latest position |
+| 7 | Click near the **edge** of the cluster, radius ≈ 1500 m, fire | |
+| 8 | Watch `/emergency` fill in | The timeline is pushed by the server over a WebSocket, not polled |
+| 9 | Point at a grey ✖ marker | No coverage, no LoRa — this is the gap the project exists to close |
+| 10 | Point at the green route | A real cycle path, not a straight line. Compare the route length with the air distance |
+| 11 | Look at the **מצב מכשיר** column in the table | Battery % and an operational badge — Requirement #1's device telemetry |
+| 12 | If the primary card shows an amber warning | The closest AED was confirmed broken, so the algorithm routed to a farther one that works — `isOperational` changing a real decision, not just a display |
+| 13 | Open `/admin`, log in | JWT access token in memory; refresh token in an httpOnly cookie |
+| 14 | Press F5 | Still logged in — silently re-authenticated from the cookie |
+| 15 | Edit a content block, save, reload `/` | Requirement #12: the site's copy is data |
+| 16 | Show the responders table: search, suspend, delete | Deleting cascades to their equipment |
+| 16b | Point at the **שידור אחרון** column | The only column not from MySQL — `api` asks `mesh` over the internal service call. Same 180-min threshold as the map and the dispatcher |
+| 17 | Open `/buy` | Three vendors, and the 433 MHz warning explained as a hardware property |
+
+**Step 12 needs a bit of luck** — only about 1 in 7 seeded AED carriers comes back non-operational,
+so a random click will not always produce the warning. To guarantee it for a defence: before the
+demo, run `curl http://localhost:5000/telemetry/latest` and note the `lat`/`lng` of a row with
+`"isOperational":false`, then click that exact spot on the simulator map with a small radius
+(around 300–500 m) so it is the only — or closest — AED carrier sampled.
+
+**If asked "what is actually simulated?"** — answer directly: the radio propagation, the SMS
+delivery and the device positions. The databases, the geospatial query, the cross-service join,
+the authentication, the WebSocket and the bicycle routing are all real. See section 12 of the
+[readme](readme.md#12-what-is-real-and-what-is-simulated).
+
+---
+
+## 9. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `[api] cannot reach MySQL` | WAMP is not running | Start WAMP, wait for the green tray icon |
+| `[mesh] cannot reach MongoDB` | The service is stopped | `net start MongoDB` in an admin terminal |
+| `EADDRINUSE` on 3000/4000/5000 | An orphaned process | `netstat -ano \| findstr ":4000"` then `taskkill /F /PID <pid>` |
+| Every page suddenly returns **500** after running `npm run build` | `next build` and `next dev` share the `.next` folder, and the build overwrote what the running dev server had loaded | Stop with `Ctrl+C` and run `npm run dev` again. **Never run a production build while the dev server is running** |
+| Every dispatch returns 502 | `INTERNAL_SERVICE_KEY` differs between the two `.env` files | Make them identical, restart both servers |
+| Simulator map has only the 🆘 marker | The mesh service or MongoDB is down | Check the mesh log |
+| Map shows fewer dots than expected | Working as designed — devices silent for over 180 min are hidden | Read the banner above the map; re-run `npm run seed` to refresh timestamps, or raise `MAX_HEARTBEAT_AGE_MIN` |
+| `Table 'field_defib.admins' doesn't exist` | Schema never created | `npm run db:schema`, then `npm run seed` |
+| The route is a dashed grey line | The routing service was unreachable | Check internet. Everything else still works |
+| Login says the password is wrong | The database was rebuilt without re-seeding | `npm run seed` recreates the admin |
+| A valid phone number is rejected | Only Israeli mobiles are accepted | `05X` + 7 digits. Landlines are not accepted |
+| Emergency page says "מנותק" | The WebSocket dropped, usually because the mesh server restarted | Reload the page |
+
+---
+
+## 10. Reference
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `npm run dev` | Start all three services |
+| `npm run dev:api` / `dev:mesh` / `dev:web` | Start one service |
+| `npm run db:schema` | Create the database and tables |
+| `npm run seed` | Fill both databases (safe to repeat) |
+| `npm test` | Run both backend test suites |
+| `npm run test:geofencing` | Geo-fence, freshness and prioritisation assertions |
+| `npm run test:maintenance` | Low-battery alert state machine |
+| `npm run install:all` | Install dependencies for all four packages |
+| `npm --prefix web run build` | Production build of the front end |
+
+### Environment files
+
+| File | Key settings |
+|---|---|
+| `api/.env` | `MYSQL_*`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `INTERNAL_SERVICE_KEY`, `MESH_URL`, `ADMIN_USERNAME`, `ADMIN_PASSWORD` |
+| `mesh/.env` | `MONGO_URI`, `API_URL`, `INTERNAL_SERVICE_KEY`, `MAX_HEARTBEAT_AGE_MIN`, `BROUTER_URL` |
+| `web/.env.local` | `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_MESH_URL`, `NEXT_PUBLIC_MESH_WS` |
+
+`INTERNAL_SERVICE_KEY` must match between the first two. The two JWT secrets must be different
+from each other — that is deliberate, so a leak of one does not compromise the other.
+
+### Databases
+
+**MySQL `field_defib`** — `admins`, `refresh_tokens`, `responders`, `devices`, `content_blocks`,
+`external_links`
+
+**MongoDB `field_defib`** — `telemetry`, `alerts`, `mesh_events`, `maintenance_alerts`
+
+### Simulator defaults
+
+| Setting | Default | Where to change |
+|---|---|---|
+| Map centre | Yarkon Park, 32.1010 / 34.8090 | `web/lib/config.js` |
+| Radius | 1500 m | Slider, or the same file |
+| Sample size | 8 | Slider, or the same file |
+| Heartbeat freshness limit | 180 minutes | `MAX_HEARTBEAT_AGE_MIN` in `mesh/.env` |
+| Seeded volunteers | 50 | `RESPONDER_COUNT` in `scripts/seed.js` |
+
+---
+
+*This guide covers operation. For the architecture, the two-database rationale and the LoRa theory,
+see [readme.md](readme.md).*
